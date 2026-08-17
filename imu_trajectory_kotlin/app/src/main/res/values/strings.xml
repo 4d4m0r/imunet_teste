@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">IMU Trajectory</string>
+    <string name="start">Iniciar</string>
+    <string name="stop">Parar</string>
+</resources>

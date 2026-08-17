@@ -1,0 +1,9 @@
+IMUNet/Datasets/
+IMUNet/RONIN_torch/cache/
+IMUNet/RONIN_torch/Test_out/
+**/__pycache__/
+*.pyc
+
+imu_trajectory_kotlin/.gradle/
+imu_trajectory_kotlin/**/build/
+.claude/settings.local.json
