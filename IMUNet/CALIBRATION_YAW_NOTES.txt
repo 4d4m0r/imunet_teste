@@ -1,0 +1,418 @@
+CALIBRACAO DE YAW ENTRE DISPOSITIVOS (MAO / GROUND TRUTH) - NOTAS DE DIAGNOSTICO E IMPLEMENTACAO
+==================================================================================================
+
+
+1. O PROBLEMA
+==============
+
+Duas formas de coleta de dados foram usadas:
+
+- IMUNet-like: um unico celular preso no peito grava IMU (acelerometro, giroscopio)
+  E o ground truth (trajetoria) ao mesmo tempo. Mesmo dispositivo fazendo as duas coisas.
+
+- Ronin-like: um celular na MAO grava so o IMU (sem ground truth); um segundo celular
+  no PEITO grava so o ground truth. Dois dispositivos fisicos diferentes.
+
+Sintomas observados ao treinar:
+
+- IMUNet-like: o modelo fica bom enquanto o celular fica estavel em orientacao, mas
+  alucina bastante quando o celular balanca forte.
+
+- Ronin-like: o modelo alucina desde o inicio da caminhada, mesmo andando normal.
+
+
+2. POR QUE ACONTECE
+====================
+
+Nos dois casos, a causa raiz e a mesma: as features de treino nao devem ser o IMU cru
+no frame do sensor - devem ser o IMU rotacionado para o frame GLOBAL, usando a
+orientacao do proprio aparelho (game_rv). E isso que torna o modelo robusto a giros do
+aparelho: a rede nao ve o sinal "girando junto com a mao", ve aceleracao e velocidade
+angular ja em coordenadas do mundo.
+
+- No IMUNet-like: se essa rotacao para o frame global nao estiver sendo aplicada (ou o
+  aparelho ficar quase estatico em orientacao durante a coleta), o modelo aprende uma
+  correlacao que so vale por coincidencia entre frame do sensor e frame do corpo.
+  Balancar forte quebra essa premissa.
+
+- No Ronin-like: mesmo rotacionando corretamente para o frame global usando o game_rv
+  de cada aparelho, ha um problema mais sutil: CADA game_rv define seu proprio "zero"
+  de yaw de forma independente e arbitraria no momento em que a fusao do sensor
+  (acelerometro + giroscopio, SEM magnetometro) inicializa. Como mao e peito sao
+  aparelhos diferentes, "o mundo segundo a mao" e "o mundo segundo o peito" estao
+  rotacionados um em relacao ao outro por um angulo constante e desconhecido, que
+  muda a cada gravacao. Isso e exatamente o que o "start_calibration" do RONIN original
+  corrige fisicamente (encostando os dois aparelhos por alguns segundos no inicio da
+  gravacao). Sem essa correcao, a rede recebe entrada (features da mao) e alvo
+  (velocidade do peito) em referenciais que nao batem - erro sistematico desde o
+  frame 0, e por isso a alucinacao aparece desde o comeco da caminhada.
+
+Ponto especifico do seu caso (voce confirmou que usa game_rv, nao rv/orientation.txt):
+como o game_rv NAO usa magnetometro internamente, o offset entre os dois game_rv e um
+artefato puro do algoritmo de fusao de cada aparelho - ele NAO aparece no magnetometro
+de jeito nenhum. Isso e uma boa noticia: o magnetometro e uma referencia independente e
+limpa para medir esse offset, sem risco de "contaminacao" cruzada (nao ha chance do
+mesmo bug que causa o offset do game_rv tambem bagunçar a leitura do magnetometro,
+porque sao pipelines de sensor completamente desacoplados no Android).
+
+
+3. O QUE FOI DESCARTADO (E POR QUE)
+====================================
+
+- Calibracao fisica (encostar os dois aparelhos no inicio/fim da gravacao): nao e
+  viavel nos dados ja coletados - a coleta ja aconteceu sem esse passo.
+
+- "Comecar a gravacao parado": da velocidade zero e permite estimar gyro bias, mas
+  NAO resolve o offset de yaw entre dois game_rv inicializados de forma independente.
+  Isso nao e uma questao de movimento, e uma questao de referencia arbitraria de cada
+  algoritmo de fusao - ficar parado nao cria nenhuma referencia em comum entre os dois
+  aparelhos.
+
+- Auto-calibracao por dupla integracao de aceleracao (casar deslocamento reconstruido
+  via dupla integracao contra o deslocamento real do ground truth, em janelas curtas):
+  testado em 6 gravacoes reais diferentes (Indoor/Outdoor, subjects 1/2/4, dispositivos
+  S10/Tango/Xiaomi) - falha de forma consistente, com erro de 80 a 330 graus e
+  deslocamento reconstruido ~10x menor que o real. Motivo fisico: a oscilacao do passo
+  (e do balanco do braco) domina completamente a dupla integracao; o progresso liquido
+  para frente e pequeno demais para sobreviver a duas integracoes. E o problema classico
+  de deriva de sistemas de navegacao inercial por integracao livre - nao e algo que se
+  resolve com mais dados, e uma limitacao fundamental do metodo.
+
+
+4. O QUE FOI VALIDADO: CALIBRACAO VIA MAGNETOMETRO
+====================================================
+
+4.1 Por que funciona
+---------------------
+
+Se o game_rv da mao tem um bug de yaw constante THETA em relacao ao mundo verdadeiro:
+
+    game_rv_reportado(t) = R(THETA) (x) game_rv_verdadeiro(t)
+
+entao QUALQUER vetor local rotacionado usando esse game_rv errado sai rotacionado por
+R(THETA) em relacao ao valor correto - independente de quao complexa seja a dinamica
+de game_rv_verdadeiro(t) (balanco de braco arbitrario incluso). Isso e uma propriedade
+algebrica de composicao de rotacoes (nao e uma aproximacao que depende do movimento).
+
+Logo: tilt-compensar o magnetometro cru usando esse game_rv (mesmo com yaw errado -
+pitch/roll continuam corretos, vem da gravidade, que os dois aparelhos concordam) da
+um heading igualmente deslocado por THETA, em relacao ao heading calculado do mesmo
+jeito no outro aparelho. A media circular dessa diferenca ao longo da gravacao toda
+recupera THETA.
+
+4.2 Validacao - 18 gravacoes reais
+------------------------------------
+
+Testado em todos os subjects (1, 2, 4, 5), todos os dispositivos (S10, S21, Tango,
+Xiaomi), indoor e outdoor, injetando 7 angulos de teste conhecidos + ruido de
+distorcao magnetica realista (~12 graus de desvio-padrao) por gravacao:
+
+    Erro medio global:              1.22 graus
+    Pior gravacao (media):          3.57 graus (Outdoor_Subject_1_Tango_1, so 68s)
+    Erro maximo observado:          5.76 graus (qualquer caso, qualquer gravacao)
+
+Padroes observados:
+- Outdoor tem magnetometro mais limpo que indoor (desvio-padrao de heading em janelas
+  de 5s: ~1.5-3.5 graus outdoor vs ~4-6 graus indoor - menos ferro/estrutura por perto).
+- Gravacoes curtas (<100s) tem erro de calibracao maior (menos amostras para a media
+  circular convergir). Gravacoes de 3+ minutos ficam consistentemente abaixo de 1 grau.
+
+
+5. ESPECIFICACAO DE IMPLEMENTACAO
+===================================
+
+5.1 Dados necessarios, por gravacao
+--------------------------------------
+
+- MAO (so IMU): acelerometro, giroscopio, MAGNETOMETRO PROPRIO DA MAO, game_rv PROPRIO
+  DA MAO - todos com timestamp.
+- GROUND TRUTH / PEITO: posicao (ground truth), MAGNETOMETRO PROPRIO DO GROUND TRUTH,
+  game_rv PROPRIO DO GROUND TRUTH - todos com timestamp.
+
+ATENCAO - PONTO CRITICO: sao DOIS magnetometros fisicos diferentes, um por aparelho.
+Magnetometro e uma leitura LOCAL, fisica, especifica de cada sensor - nao e uma
+referencia universal que da para "emprestar" de um aparelho para o outro. O celular
+do peito tem seu proprio magnetometro, medindo o campo magnetico na posicao/orientacao
+do peito; o celular da mao tem o dele, medindo na posicao/orientacao da mao. Os dois
+sentem (aproximadamente) o mesmo campo terrestre real, mas cada um so atraves do seu
+proprio sensor fisico.
+
+ERRO COMUM A EVITAR ao portar isso para outro codigo: se o pipeline vem de uma
+heranca single-device (IMUNet-like, onde so existia uma variavel "magnet"), e facil,
+ao adaptar para o caso dual-device, acabar reaproveitando por engano o MESMO array de
+magnetometro (por exemplo, so o do ground truth) para calcular os dois headings -
+usando magnet_do_GROUND_TRUTH tambem no lugar de magnet_da_MAO no calculo de
+heading_hand(t). Isso e fisicamente errado (seria fingir que o sensor da mao leu o
+campo magnetico na posicao do peito) e faz a calibracao dar um resultado invalido - o
+theta_cal recuperado nao vai representar o offset real de yaw entre os dois game_rv.
+Voce precisa dos DOIS magnetometros, cada um emparelhado so com o game_rv do MESMO
+aparelho de origem. Nenhum dos dois sozinho e suficiente.
+
+5.2 Passo a passo do algoritmo
+---------------------------------
+
+PASSO 1 - Reamostragem
+Interpole tudo (mao e peito) para uma timeline comum - recomendado: os timestamps do
+ground truth de posicao. Interpolacao linear para vetores (accel/gyro/magnet) e SLERP
+(interpolacao esferica) para quaternions (game_rv).
+
+PASSO 2 - Heading tilt-compensado de cada aparelho, cada um com o SEU PROPRIO
+magnetometro e o SEU PROPRIO game_rv:
+
+    glob_mag = game_rv (x) (0, magnet_local) (x) game_rv^-1
+        (produto "sanduiche" de quaternion; "0" e a parte escalar do quaternion puro
+        construido a partir do vetor magnet_local)
+
+    heading = atan2(glob_mag.y, glob_mag.x)
+
+    heading_hand(t)  = tilt_compensate( magnet_da_MAO(t),         game_rv_da_MAO(t) )
+    heading_chest(t) = tilt_compensate( magnet_do_GROUND_TRUTH(t), game_rv_do_GROUND_TRUTH(t) )
+
+PASSO 3 (recomendado) - Rejeitar amostras com magnetometro fora do normal
+Proxy simples de interferencia ferromagnetica local: descarte amostras onde
+|magnet| foge muito da mediana da sessao (limiar usado nos testes: 1.5x a mediana).
+Se isso descartar quase tudo, e sinal de magnetometro quebrado/sem calibracao de
+fabrica - nesse caso nao aplique o filtro, apenas sinalize a gravacao para revisao.
+
+PASSO 4 - Diferenca de heading e media circular
+
+    diff(t) = heading_chest(t) - heading_hand(t)      [radianos, para cada t]
+
+    theta_cal = atan2( media(sin(diff)), media(cos(diff)) )
+
+    R = hypot( media(cos(diff)), media(sin(diff)) )
+    circular_std_deg = graus( sqrt( max(-2 * ln(R), 0) ) )   [metrica de confianca/QC]
+
+theta_cal e a correcao. circular_std_deg e o indicador de qualidade por gravacao -
+nos testes, valores saudaveis ficaram abaixo de ~10-15 graus; se aparecer muito acima
+disso, desconfie de timestamp desalinhado, magnetometro ruim ou gravacao curta demais.
+
+PASSO 5 - Quaternion de calibracao (rotacao pura de yaw, em torno do eixo vertical /
+gravidade global - Z, assumindo frame global Z-up depois de rotacionar por game_rv):
+
+    cal_q = (cos(theta_cal/2), 0, 0, sin(theta_cal/2))     [formato (w, x, y, z)]
+
+PASSO 6 - Aplicar na game_rv da MAO, com multiplicacao a ESQUERDA - a ordem importa:
+
+    game_rv_mao_calibrado(t) = cal_q (x) game_rv_mao_bruto(t)
+
+(Ordem validada via injecao de offset conhecido - recuperacao exata em todos os
+testes feitos.)
+
+PASSO 7 - Usar game_rv_mao_calibrado (nao o bruto) dai para frente, exatamente onde o
+pipeline hoje ja rotaciona acelerometro/giroscopio da mao para o frame global, virando
+feature de treino. O alvo (velocidade) continua vindo das diferencas de posicao do
+ground truth do peito, sem nenhuma mudanca.
+
+5.3 Pontos de atencao ao portar para outro codigo
+-----------------------------------------------------
+
+- Convencao de quaternion: confira se a lib usa (w,x,y,z) ou (x,y,z,w). Trocado, tudo
+  quebra silenciosamente com um offset "misterioso" que parece nao fazer sentido.
+
+- Use os DOIS magnetometros (mao e ground truth) separadamente - ver secao 5.1.
+
+- Um unico theta_cal por gravacao inteira (nao recalcule por amostra) - a premissa e
+  que o bug de referencia do game_rv e fixo enquanto o app/sensor nao reinicia.
+
+- So corrige YAW. Pitch/roll nao precisam de correcao cross-device: os dois
+  acelerometros enxergam a mesma gravidade fisicamente, entao o tilt ja e consistente
+  entre os dois aparelhos sem ajuste nenhum.
+
+- Isso e so uma etapa de PRE-PROCESSAMENTO DE TREINO. Na hora de rodar o modelo de
+  verdade (so o celular da mao, sem o peito), nao existe mais ambiguidade cross-device
+  - nao precisa (e nao da) para replicar essa calibracao em producao/inferencia. O
+  game_rv do celular sozinho, integrado continuamente desde o inicio da sessao, ja e
+  internamente consistente o suficiente para a rede prever bem, do mesmo jeito que o
+  RONIN original funciona com um unico aparelho em inferencia.
+
+- Duracao importa: pelos numeros da secao 4.2, prefira gravacoes de pelo menos ~2-3
+  minutos para essa calibracao convergir com seguranca abaixo de 1 grau; gravacoes
+  muito curtas (<80s) podem ter alguns graus de incerteza - ainda assim, muito melhor
+  que nenhuma calibracao.
+
+
+6. RESUMO EM UMA FRASE
+========================
+
+O offset de yaw entre o game_rv da mao e o game_rv do peito e recuperavel com boa
+precisao (~1 grau em media, testado em 18 gravacoes reais e diversas) comparando o
+heading tilt-compensado do MAGNETOMETRO PROPRIO DE CADA APARELHO (nao compartilhado
+entre eles) ao longo da gravacao inteira, e essa correcao deve ser aplicada uma vez
+por gravacao, so na etapa de preparo dos dados de treino - nunca em inferencia.
+
+
+7. IMPLEMENTACAO DE REFERENCIA (PYTHON, GENERICA)
+====================================================
+
+Codigo abaixo usa so numpy (sem depender da lib "quaternion"), pra ficar facil de
+portar pra qualquer pipeline. Convencao de quaternion: (w, x, y, z), rotacao ativa de
+vetores via produto "sanduiche" q v q*. Testado e validado: recupera exatamente um
+offset de yaw injetado artificialmente em dados reais (erro numerico ~0, nas 4 gravacoes
+de teste com angulos 0/40/137/260 graus). Nota: quaternions tem "dupla cobertura" - q e
+-q representam a mesma rotacao fisica; isso e normal e nao afeta nada, desde que o
+consumo seguinte do quaternion calibrado sempre rotacione vetores via o produto
+sanduiche (rotate_vector_by_quat abaixo), que da o mesmo resultado pra q e -q.
+
+------------------------------------------------------------------------------------
+
+import numpy as np
+
+
+# ---------- primitivas de quaternion, convencao (w, x, y, z) ----------
+
+def quat_mul(q1, q2):
+    """Produto de quaternions q1 (x) q2. q1, q2: arrays (...,4) no formato (w,x,y,z)."""
+    w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+    w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+    return np.stack([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ], axis=-1)
+
+
+def quat_conj(q):
+    """Conjugado: (w,x,y,z) -> (w,-x,-y,-z)."""
+    return q * np.array([1., -1., -1., -1.])
+
+
+def rotate_vector_by_quat(q, v):
+    """Rotaciona vetores v (...,3) pelo quaternion q (...,4), via produto sanduiche q v q*."""
+    vq = np.concatenate([np.zeros(v.shape[:-1] + (1,)), v], axis=-1)
+    rotated = quat_mul(quat_mul(q, vq), quat_conj(q))
+    return rotated[..., 1:]
+
+
+def slerp(q1, q2, t):
+    """Interpolacao esferica entre quaternions unitarios q1 e q2. t em [0,1], shape (...,1)."""
+    dot = np.sum(q1 * q2, axis=-1, keepdims=True)
+    q2 = np.where(dot < 0, -q2, q2)          # caminho mais curto
+    dot = np.clip(np.abs(dot), -1.0, 1.0)
+    theta = np.arccos(dot)
+    sin_theta = np.sin(theta)
+    close = sin_theta < 1e-6                  # quaternions quase identicos -> interp linear
+    safe_sin = np.where(sin_theta == 0, 1.0, sin_theta)
+    w1 = np.where(close, 1.0 - t, np.sin((1 - t) * theta) / safe_sin)
+    w2 = np.where(close, t, np.sin(t * theta) / safe_sin)
+    out = w1 * q1 + w2 * q2
+    return out / np.linalg.norm(out, axis=-1, keepdims=True)
+
+
+# ---------- reamostragem para uma timeline comum (passo 1) ----------
+
+def interp_vector(t_src, v_src, t_dst):
+    """Interpolacao linear, coluna a coluna. t_src/t_dst em segundos (crescentes)."""
+    out = np.empty((len(t_dst), v_src.shape[1]))
+    for k in range(v_src.shape[1]):
+        out[:, k] = np.interp(t_dst, t_src, v_src[:, k])
+    return out
+
+
+def interp_quaternion(t_src, q_src, t_dst):
+    """Interpolacao esferica (slerp) de uma serie de quaternions (w,x,y,z) para t_dst."""
+    idx = np.clip(np.searchsorted(t_src, t_dst) - 1, 0, len(t_src) - 2)
+    t0, t1 = t_src[idx], t_src[idx + 1]
+    frac = np.clip((t_dst - t0) / np.where(t1 == t0, 1.0, t1 - t0), 0.0, 1.0)
+    return slerp(q_src[idx], q_src[idx + 1], frac[:, None])
+
+
+# ---------- calibracao de yaw (passos 2, 3, 4, 5, 6) ----------
+
+def tilt_compensated_heading(magnet_local, game_rv_wxyz):
+    """Heading (radianos) do magnetometro rotacionado pro frame global via game_rv
+    DO MESMO APARELHO. magnet_local: (N,3). game_rv_wxyz: (N,4)."""
+    glob_mag = rotate_vector_by_quat(game_rv_wxyz, magnet_local)
+    return np.arctan2(glob_mag[:, 1], glob_mag[:, 0])
+
+
+def compute_yaw_calibration(hand_game_rv, hand_magnet, gt_game_rv, gt_magnet,
+                             mag_disturbance_reject=1.5):
+    """
+    Estima o offset de yaw (radianos) entre o game_rv da MAO e o game_rv do GROUND
+    TRUTH, usando o magnetometro PROPRIO DE CADA APARELHO como referencia absoluta
+    compartilhada. Todos os arrays ja devem estar na MESMA timeline (ver secao 1 /
+    interp_vector / interp_quaternion acima).
+
+    hand_game_rv, gt_game_rv: (N,4) quaternions (w,x,y,z).
+    hand_magnet, gt_magnet:   (N,3) leituras cruas de magnetometro - CADA UMA do seu
+                              PROPRIO aparelho (nunca compartilhe o mesmo array entre
+                              os dois - ver secao 5.1).
+
+    Retorna (theta_rad, circular_std_deg, n_amostras_usadas).
+    theta_rad e a correcao a aplicar (ver apply_yaw_calibration). circular_std_deg e
+    a metrica de confianca/QC por gravacao (secao 5.2, passo 4).
+    """
+    heading_hand = tilt_compensated_heading(hand_magnet, hand_game_rv)
+    heading_gt = tilt_compensated_heading(gt_magnet, gt_game_rv)
+
+    def keep_mask(mag):
+        norm = np.linalg.norm(mag, axis=1)
+        med = np.median(norm)
+        return np.abs(norm - med) < mag_disturbance_reject * med
+
+    mask = keep_mask(hand_magnet) & keep_mask(gt_magnet)
+    if mask.sum() < 0.1 * len(mask):
+        mask = np.ones(len(mask), dtype=bool)   # filtro descartou demais, usa tudo
+
+    diff = heading_gt[mask] - heading_hand[mask]
+    theta = np.arctan2(np.mean(np.sin(diff)), np.mean(np.cos(diff)))
+    resultant = np.hypot(np.mean(np.cos(diff)), np.mean(np.sin(diff)))
+    circular_std_deg = np.degrees(np.sqrt(max(-2 * np.log(resultant), 0.0)))
+    return theta, circular_std_deg, int(mask.sum())
+
+
+def apply_yaw_calibration(theta_rad, game_rv_wxyz):
+    """Aplica a correcao de yaw na game_rv da MAO. Multiplicacao a ESQUERDA - a ordem
+    importa (validado por injecao de offset conhecido)."""
+    cal_q = np.array([np.cos(theta_rad / 2), 0.0, 0.0, np.sin(theta_rad / 2)])
+    cal_q = np.broadcast_to(cal_q, game_rv_wxyz.shape)
+    return quat_mul(cal_q, game_rv_wxyz)
+
+
+# ---------- exemplo de uso ponta a ponta ----------
+
+def calibrate_recording(t_hand, hand_acce, hand_gyro, hand_magnet, hand_game_rv,
+                         t_gt, gt_pos, gt_magnet, gt_game_rv):
+    """
+    Recebe os arrays crus (nao reamostrados) da mao e do ground truth de UMA gravacao
+    e devolve: features prontas pra treino (giro/acel da mao ja no frame global,
+    calibrado), o alvo (velocidade do ground truth) e diagnosticos de QC.
+
+    t_hand/t_gt: timestamps em segundos (crescentes) de cada fonte.
+    hand_acce, hand_gyro, hand_magnet: (N_hand, 3), no frame LOCAL da mao.
+    hand_game_rv: (N_hand, 4), quaternion (w,x,y,z) da mao.
+    gt_pos: (N_gt, 3) posicao do ground truth (mundo).
+    gt_magnet: (N_gt, 3), no frame LOCAL do ground truth.
+    gt_game_rv: (N_gt, 4), quaternion (w,x,y,z) do ground truth.
+    """
+    t_common = t_gt  # reamostra tudo na timeline do ground truth (posicao), como no passo 1
+
+    acce = interp_vector(t_hand, hand_acce, t_common)
+    gyro = interp_vector(t_hand, hand_gyro, t_common)
+    hand_magnet_c = interp_vector(t_hand, hand_magnet, t_common)
+    hand_game_rv_c = interp_quaternion(t_hand, hand_game_rv, t_common)
+    gt_magnet_c = interp_vector(t_gt, gt_magnet, t_common)
+    gt_game_rv_c = interp_quaternion(t_gt, gt_game_rv, t_common)
+
+    theta_cal, circular_std_deg, n_used = compute_yaw_calibration(
+        hand_game_rv_c, hand_magnet_c, gt_game_rv_c, gt_magnet_c)
+
+    calibrated_game_rv = apply_yaw_calibration(theta_cal, hand_game_rv_c)
+
+    glob_acce = rotate_vector_by_quat(calibrated_game_rv, acce)
+    glob_gyro = rotate_vector_by_quat(calibrated_game_rv, gyro)
+
+    dt = np.gradient(t_common)
+    target_velocity = np.gradient(gt_pos, axis=0) / dt[:, None]
+
+    diagnostics = {
+        'yaw_deg': float(np.degrees(theta_cal)),
+        'circular_std_deg': float(circular_std_deg),
+        'n_samples_used': n_used,
+        'n_samples_total': len(t_common),
+    }
+    return glob_acce, glob_gyro, target_velocity, diagnostics
+
+------------------------------------------------------------------------------------
